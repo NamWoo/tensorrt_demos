@@ -1,7 +1,9 @@
-"""trt_yolo.py
+"""trt_yolo_cv.py
 
-This script demonstrates how to do real-time object detection with
+This script helps making inference object detection video with
 TensorRT optimized YOLO engine.
+"cv"means "create video"
+made by BigJoon (ref. jkjung-avt)
 """
 
 
@@ -20,64 +22,64 @@ from utils.visualization import BBoxVisualization
 from utils.yolo_with_plugins import TrtYOLO
 
 
-WINDOW_NAME = 'TrtYOLODemo'
 
 
 def parse_args():
     """Parse input arguments."""
-    desc = ('Capture and display live camera video, while doing '
-            'real-time object detection with TensorRT optimized '
+    desc = ('capture Video input file and save BBoxed Video'
+            'object detection with TensorRT optimized '
             'YOLO model on Jetson')
     parser = argparse.ArgumentParser(description=desc)
     parser = add_camera_args(parser)
     parser.add_argument(
-        '-c', '--category_num', type=int, default=80,
-        help='number of object categories [80]')
+        '-v', '--video_name',type=str, required=True,
+        help='You need to put input video')
+    parser.add_argument(
+        '-o', '--result_video',type=str, required=True,
+        help='You need to put output video name')
+    parser.add_argument(
+        '-c', '--category_num', type=int, default=15,
+        help='number of object categories [15]')
     parser.add_argument(
         '-m', '--model', type=str, required=True,
         help=('[yolov3|yolov3-tiny|yolov3-spp|yolov4|yolov4-tiny]-'
               '[{dimension}], where dimension could be a single '
               'number (e.g. 288, 416, 608) or WxH (e.g. 416x256)'))
-    parser.add_argument(
-        '-l', '--letter_box', action='store_true',
-        help='inference with letterboxed image [False]')
     args = parser.parse_args()
     return args
 
 
-def loop_and_detect(cam, trt_yolo, conf_th, vis):
+def loop_and_detect(cap, trt_yolo,result_video, conf_th,vis):
     """Continuously capture images from camera and do object detection.
 
     # Arguments
-      cam: the camera instance (video source).
+      cap: the camera instance (video source).
       trt_yolo: the TRT YOLO object detector instance.
       conf_th: confidence/score threshold for object detection.
       vis: for visualization.
     """
-    full_scrn = False
+    #full_scrn = False
     fps = 0.0
     tic = time.time()
+    frame_width = int(cap.get(3))
+    frame_height = int(cap.get(4))
+    out = cv2.VideoWriter(result_video,cv2.VideoWriter_fourcc(*'mp4v'),30,(frame_width,frame_height))
     while True:
-        if cv2.getWindowProperty(WINDOW_NAME, 0) < 0:
-            break
-        img = cam.read()
-        if img is None:
-            break
-        boxes, confs, clss = trt_yolo.detect(img, conf_th)
-        img = vis.draw_bboxes(img, boxes, confs, clss)
-        img = show_fps(img, fps)
-        cv2.imshow(WINDOW_NAME, img)
+        ret,frame = cap.read()
+        
+        boxes, confs, clss = trt_yolo.detect(frame, conf_th)
+        frame = vis.draw_bboxes(frame, boxes, confs, clss)
+        frame = show_fps(frame, fps)
+
         toc = time.time()
         curr_fps = 1.0 / (toc - tic)
+        out.write(frame)
         # calculate an exponentially decaying average of fps number
         fps = curr_fps if fps == 0.0 else (fps*0.95 + curr_fps*0.05)
         tic = toc
-        key = cv2.waitKey(1)
-        if key == 27:  # ESC key: quit program
-            break
-        elif key == ord('F') or key == ord('f'):  # Toggle fullscreen
-            full_scrn = not full_scrn
-            set_display(WINDOW_NAME, full_scrn)
+
+    cap.release()
+    out.release()
 
 
 def main():
@@ -87,9 +89,9 @@ def main():
     if not os.path.isfile('yolo/%s.trt' % args.model):
         raise SystemExit('ERROR: file (yolo/%s.trt) not found!' % args.model)
 
-    cam = Camera(args)
-    if not cam.isOpened():
-        raise SystemExit('ERROR: failed to open camera!')
+    cap = cv2.VideoCapture(args.video_name)
+    if(cap.isOpened() == False):
+        print("unable to read read source video feed")
 
     cls_dict = get_cls_dict(args.category_num)
     yolo_dim = args.model.split('-')[-1]
@@ -103,15 +105,11 @@ def main():
     if h % 32 != 0 or w % 32 != 0:
         raise SystemExit('ERROR: bad yolo_dim (%s)!' % yolo_dim)
 
-    trt_yolo = TrtYOLO(args.model, (h, w), args.category_num, args.letter_box)
-
-    open_window(
-        WINDOW_NAME, 'Camera TensorRT YOLO Demo',
-        cam.img_width, cam.img_height)
+    trt_yolo = TrtYOLO(args.model, (h, w), args.category_num)
     vis = BBoxVisualization(cls_dict)
-    loop_and_detect(cam, trt_yolo, conf_th=0.3, vis=vis)
+    loop_and_detect(cap, trt_yolo, args.result_video , conf_th=0.3, vis=vis)
 
-    cam.release()
+
     cv2.destroyAllWindows()
 
 

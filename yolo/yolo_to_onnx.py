@@ -61,6 +61,8 @@ import numpy as np
 import onnx
 from onnx import helper, TensorProto
 
+from plugins import verify_classes, get_input_wh
+
 
 class DarkNetParser(object):
     """Definition of a parser for DarkNet-based YOLO model."""
@@ -118,6 +120,9 @@ class DarkNetParser(object):
         remainder -- a string with all raw text after the previously parsed layer
         """
         remainder = remainder.split('[', 1)
+        while len(remainder[0]) > 0 and remainder[0][-1] == '#':
+            # handling commented-out layers
+            remainder = remainder[1].split('[', 1)
         if len(remainder) == 2:
             remainder = remainder[1]
         else:
@@ -143,7 +148,8 @@ class DarkNetParser(object):
         layer_dict = dict(type=layer_type)
         if layer_type in self.supported_layers:
             for param_line in layer_param_lines:
-                if param_line[0] == '#':
+                param_line = param_line.lstrip().split('#')[0]
+                if not param_line:
                     continue
                 param_type, param_value = self._parse_params(param_line)
                 layer_dict[param_type] = param_value
@@ -372,7 +378,6 @@ class WeightLoader(object):
         elif param_category == 'conv':
             if suffix == 'weights':
                 param_shape = [channels_out, channels_in, filter_h, filter_w]
-                #print(param_shape)
             elif suffix == 'bias':
                 param_shape = [channels_out]
         param_size = np.product(np.array(param_shape))
@@ -446,7 +451,6 @@ class GraphBuilderONNX(object):
             _, layer_type = layer_name.split('_', 1)
             params = self.param_dict[layer_name]
             if layer_type == 'convolutional':
-                #print('%s  ' % layer_name, end='')
                 initializer_layer, inputs_layer = weight_loader.load_conv_weights(
                     params)
                 initializer.extend(initializer_layer)
@@ -503,11 +507,7 @@ class GraphBuilderONNX(object):
                 major_node_specs = MajorNodeSpecs(major_node_output_name,
                                                   major_node_output_channels)
             else:
-                print(
-                    'Layer of type %s not supported, skipping ONNX node generation.' %
-                    layer_type)
-                major_node_specs = MajorNodeSpecs(layer_name,
-                                                  None)
+                raise TypeError('layer of type %s not supported' % layer_type)
         return major_node_specs
 
     def _make_input_tensor(self, layer_name, layer_dict):
@@ -517,14 +517,14 @@ class GraphBuilderONNX(object):
         layer_name -- the layer's name (also the corresponding key in layer_configs)
         layer_dict -- a layer parameter dictionary (one element of layer_configs)
         """
-        batch_size = layer_dict['batch']
+        #batch_size = layer_dict['batch']
         channels = layer_dict['channels']
         height = layer_dict['height']
         width = layer_dict['width']
-        self.batch_size = batch_size
+        #self.batch_size = batch_size
         input_tensor = helper.make_tensor_value_info(
             str(layer_name), TensorProto.FLOAT, [
-                batch_size, channels, height, width])
+                self.batch_size, channels, height, width])
         self.input_tensor = input_tensor
         return layer_name, channels
 
@@ -635,14 +635,14 @@ class GraphBuilderONNX(object):
                 'Softplus',
                 inputs=inputs,
                 outputs=[layer_name_softplus],
-                name=layer_name_softplus,
+                name=layer_name_softplus
             )
             self._nodes.append(softplus_node)
             tanh_node = helper.make_node(
                 'Tanh',
                 inputs=[layer_name_softplus],
                 outputs=[layer_name_tanh],
-                name=layer_name_tanh,
+                name=layer_name_tanh
             )
             self._nodes.append(tanh_node)
 
@@ -651,16 +651,28 @@ class GraphBuilderONNX(object):
                 'Mul',
                 inputs=inputs,
                 outputs=[layer_name_mish],
-                name=layer_name_mish,
+                name=layer_name_mish
             )
             self._nodes.append(mish_node)
 
             inputs = [layer_name_mish]
             layer_name_output = layer_name_mish
+        elif layer_dict['activation'] == 'logistic':
+            layer_name_lgx = layer_name + '_lgx'
+
+            lgx_node = helper.make_node(
+                'Sigmoid',
+                inputs=inputs,
+                outputs=[layer_name_lgx],
+                name=layer_name_lgx
+            )
+            self._nodes.append(lgx_node)
+            inputs = [layer_name_lgx]
+            layer_name_output = layer_name_lgx
         elif layer_dict['activation'] == 'linear':
             pass
         else:
-            print('Activation not supported.')
+            raise TypeError('%s activation not supported' % layer_dict['activation'])
 
         self.param_dict[layer_name] = conv_params
         return layer_name_output, filters
@@ -855,13 +867,13 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        '--model', type=str, required=True,
+        '-c', '--category_num', type=int, default=80,
+        help='number of object categories [80]')
+    parser.add_argument(
+        '-m', '--model', type=str, required=True,
         help=('[yolov3|yolov3-tiny|yolov3-spp|yolov4|yolov4-tiny]-'
               '[{dimension}], where dimension could be a single '
               'number (e.g. 288, 416, 608) or WxH (e.g. 416x256)'))
-    parser.add_argument(
-        '--category_num', type=int, default=80,
-        help='number of object categories [80]')
     args = parser.parse_args()
     if args.category_num <= 0:
         raise SystemExit('ERROR: bad category_num (%d)!' % args.category_num)
@@ -874,16 +886,12 @@ def main():
         raise SystemExit('ERROR: file (%s) not found!' % weights_file_path)
     output_file_path = '%s.onnx' % args.model
 
-    yolo_dim = args.model.split('-')[-1]
-    if 'x' in yolo_dim:
-        dim_split = yolo_dim.split('x')
-        if len(dim_split) != 2:
-            raise SystemExit('ERROR: bad yolo_dim (%s)!' % yolo_dim)
-        w, h = int(dim_split[0]), int(dim_split[1])
-    else:
-        h = w = int(yolo_dim)
-    if h % 32 != 0 or w % 32 != 0:
-        raise SystemExit('ERROR: bad yolo_dim (%s)!' % yolo_dim)
+    if not verify_classes(args.model, args.category_num):
+        raise SystemExit('ERROR: bad category_num (%d)' % args.category_num)
+
+    # Derive yolo input width/height from model name.
+    # For example, "yolov4-416x256" -> width=416, height=256
+    w, h = get_input_wh(args.model)
 
     # These are the only layers DarkNetParser will extract parameters
     # from.  The three layers of type 'yolo' are not parsed in detail
@@ -917,7 +925,15 @@ def main():
             output_tensor_dims['094_convolutional'] = [c, h // 16, w // 16]
             output_tensor_dims['106_convolutional'] = [c, h //  8, w //  8]
     elif 'yolov4' in args.model:
-        if 'tiny' in args.model:
+        if 'yolov4x-mish' in args.model:
+            output_tensor_dims['168_convolutional_lgx'] = [c, h //  8, w //  8]
+            output_tensor_dims['185_convolutional_lgx'] = [c, h // 16, w // 16]
+            output_tensor_dims['202_convolutional_lgx'] = [c, h // 32, w // 32]
+        elif 'yolov4-csp' in args.model:
+            output_tensor_dims['144_convolutional_lgx'] = [c, h //  8, w //  8]
+            output_tensor_dims['159_convolutional_lgx'] = [c, h // 16, w // 16]
+            output_tensor_dims['174_convolutional_lgx'] = [c, h // 32, w // 32]
+        elif 'tiny' in args.model:
             output_tensor_dims['030_convolutional'] = [c, h // 32, w // 32]
             output_tensor_dims['037_convolutional'] = [c, h // 16, w // 16]
         else:
